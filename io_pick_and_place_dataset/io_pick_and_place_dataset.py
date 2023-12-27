@@ -1,7 +1,12 @@
 from typing import Iterator, Tuple, Any
 
-import glob
+import os
+import json
 import numpy as np
+from pathlib import Path
+import importlib
+from concurrent.futures import ThreadPoolExecutor
+
 import tensorflow as tf
 import tensorflow_datasets as tfds
 import tensorflow_hub as hub
@@ -109,65 +114,118 @@ class IoPickAndPlaceDataset(tfds.core.GeneratorBasedBuilder):
     def _split_generators(self, dl_manager: tfds.download.DownloadManager):
         """Define data splits."""
         return {
-            'train': self._generate_examples(path='/home/io003/data/io_data/io_rlds_test/output/train/episode_*.npy'),
-            'val': self._generate_examples(path='/home/io003/data/io_data/io_rlds_test/output/val/episode_*.npy'),
+            'train': self._generate_examples(path='/home/io003/data/io_data/io_rlds_test/input/train'),
+            'val': self._generate_examples(path='/home/io003/data/io_data/io_rlds_test/input/val'),
         }
 
     def _generate_examples(self, path) -> Iterator[Tuple[str, Any]]:
         """Generator of examples for each split."""
+        pd = importlib.import_module('pandas')
+        Image = importlib.import_module('PIL.Image')
 
-        def _parse_example(episode_path):
-            # load raw data --> this should change for your dataset
-            # this is a list of dicts in our case
-            data = np.load(episode_path, allow_pickle=True)
+        def _read_images(image_root):
+            image_files = sorted(os.listdir(image_root),
+                                 key=lambda x: int(x.split('_')[-2]))
+            images = []
+
+            # Define how to load a single image
+            def load_image(file):
+                return np.array(Image.open(os.path.join(image_root, file)))
+
+            # Use ThreadPoolExecutor to load images in parallel
+            # Adjust max_workers based on your hardware and requirements
+            with ThreadPoolExecutor(max_workers=None) as executor:
+                images = list(executor.map(load_image, image_files))
+
+            return images
+
+        def _read_csv_data(csv_path):
+            return pd.read_csv(csv_path)
+
+        def _read_json_data(json_path):
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+            return data['natural_language_description']
+
+        def _parse_example(episode_path: str):
+            episode_path = Path(episode_path)
+
+            # Define paths for different image types and data files
+            rgb_path = episode_path / 'rgb'
+            depth_path = episode_path / 'depth'
+            cam_01_path = episode_path / 'cam_01'
+            cam_02_path = episode_path / 'cam_02'
+            cam_fisheye_path = episode_path / 'cam_fisheye'
+            csv_path = episode_path / 'result.csv'
+            json_path = episode_path / 'info.json'
+
+            # Read data
+            rgb_images = _read_images(rgb_path) if rgb_path.exists() else []
+            depth_images = _read_images(
+                depth_path) if depth_path.exists() else []
+            cam_01_images = _read_images(
+                cam_01_path) if cam_01_path.exists() else []
+            cam_02_images = _read_images(
+                cam_02_path) if cam_02_path.exists() else []
+            cam_fisheye_images = _read_images(
+                cam_fisheye_path) if cam_fisheye_path.exists() else []
+            csv_data = _read_csv_data(
+                csv_path) if csv_path.exists() else pd.DataFrame()
+            language_instruction = _read_json_data(
+                json_path) if json_path.exists() else ""
+            # compute Kona language embedding
+            language_embedding = self._embed([language_instruction])[0].numpy()
 
             # assemble episode --> here we're assuming demos so we set reward to 1 at the end
             episode = []
-            for i, step in enumerate(data):
-                # compute Kona language embedding
-                language_embedding = self._embed(
-                    [step['language_instruction']])[0].numpy()
-
+            data_length = len(csv_data)
+            pose_data = csv_data[['camera_link_position_x', 'camera_link_position_y', 'camera_link_position_z', 'camera_link_orientation_x',
+                                  'camera_link_orientation_y', 'camera_link_orientation_z', 'camera_link_orientation_w']].to_numpy(dtype=np.float32)
+            action_data = csv_data[['gripper_closed', 'ee_command_position_x', 'ee_command_position_y', 'ee_command_position_z',
+                                    'ee_command_rotation_x', 'ee_command_rotation_y', 'ee_command_rotation_z']].to_numpy(dtype=np.float32)
+            for i in range(data_length):
                 episode.append({
                     'observation': {
-                        'image': step['image'],
-                        'depth': step['depth'],
-                        'image_left': step['image_left'],
-                        'image_right': step['image_right'],
-                        'image_fisheye': step['image_fisheye'],
-                        'end_effector_pose': step['end_effector_pose'],
+                        'image': rgb_images[i] if i < len(rgb_images) else None,
+                        'depth': (depth_images[i].astype(np.uint16)).reshape(720, 1280, 1) if i < len(depth_images) else None,
+                        'image_left': cam_01_images[i] if i < len(cam_01_images) else None,
+                        'image_right': cam_02_images[i] if i < len(cam_02_images) else None,
+                        'image_fisheye': cam_fisheye_images[i] if i < len(cam_fisheye_images) else None,
+                        'end_effector_pose': pose_data[i]
                     },
-                    'action': step['action'],
+                    'action': action_data[i],
                     'discount': 1.0,
-                    'reward': float(i == (len(data) - 1)),
+                    'reward': float(i == (data_length - 1)),
                     'is_first': i == 0,
-                    'is_last': i == (len(data) - 1),
-                    'is_terminal': i == (len(data) - 1),
-                    'language_instruction': step['language_instruction'],
+                    'is_last': i == (data_length - 1),
+                    'is_terminal': i == (data_length - 1),
+                    'language_instruction': language_instruction,
                     'language_embedding': language_embedding,
                 })
 
             # create output data sample
+            episode_path_str = str(episode_path)
             sample = {
                 'steps': episode,
                 'episode_metadata': {
-                    'file_path': episode_path
+                    'file_path': episode_path_str
                 }
             }
 
             # if you want to skip an example for whatever reason, simply return None
-            return episode_path, sample
+            return episode_path_str, sample
 
         # create list of all examples
-        episode_paths = glob.glob(path)
+        episode_paths = [str(p) for p in Path(path).iterdir() if p.is_dir()]
 
         # for smallish datasets, use single-thread parsing
-        for sample in episode_paths:
-            yield _parse_example(sample)
+        # for sample in episode_paths.iterdir():
+        #     if sample.is_dir():
+        #         yield _parse_example(sample)
 
         # for large datasets use beam to parallelize data parsing (this will have initialization overhead)
-        # beam = tfds.core.lazy_imports.apache_beam
-        # return (
-        #         beam.Create(episode_paths)
-        #         | beam.Map(_parse_example)
-        # )
+        beam = tfds.core.lazy_imports.apache_beam
+        return (
+            beam.Create(episode_paths)
+            | beam.Map(_parse_example)
+        )
